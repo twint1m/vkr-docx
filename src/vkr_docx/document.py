@@ -19,12 +19,19 @@ from docx.oxml.ns import qn
 from lxml import etree
 from PIL import Image
 import copy
+import logging
 import random
 import string
 import re
 import os
 
 from .config import load_config
+
+logger = logging.getLogger(__name__)
+
+
+class VKRDocumentError(Exception):
+    """Ошибка при работе с документом ВКР."""
 
 
 def _gen_bookmark_id():
@@ -37,7 +44,12 @@ class VKRDocument:
 
     def __init__(self, path: str, config: dict = None):
         self.path = os.path.abspath(path)
-        self.doc = Document(self.path)
+        try:
+            self.doc = Document(self.path)
+        except Exception as exc:
+            raise VKRDocumentError(
+                f"Не удалось открыть документ '{os.path.basename(self.path)}': {exc}"
+            ) from exc
         self.cfg = config or load_config()
         self._version = self._parse_version()
         self._bm_counter = self._get_max_bookmark_id() + 1
@@ -96,9 +108,14 @@ class VKRDocument:
           1.0.0 — ВКР полностью готова
           1.0.N — правки после готовности
         """
-        m = re.search(r"ВКР (\d+\.\d+\.?\d*)", os.path.basename(self.path))
+        basename = os.path.basename(self.path)
+        m = re.search(r"ВКР (\d+\.\d+\.?\d*)", basename)
         if m:
-            return list(map(int, m.group(1).split(".")))
+            parts = list(map(int, m.group(1).split(".")))
+            while len(parts) < 3:
+                parts.append(0)
+            return parts
+        logger.warning("Не удалось распознать версию ВКР в '%s', используется 0.1.0", basename)
         return [0, 1, 0]
 
     def _next_version_path(self) -> str:
@@ -255,6 +272,12 @@ class VKRDocument:
         run.font.name = self._font
         run.font.size = Pt(self._font_size)
         self._set_paragraph_format(p, align="center", first_line=0, left=0)
+        # Разрыв страницы перед заголовком
+        pPr = p._element.find(qn("w:pPr"))
+        if pPr is None:
+            pPr = etree.SubElement(p._element, qn("w:pPr"))
+            p._element.insert(0, pPr)
+        etree.SubElement(pPr, qn("w:pageBreakBefore"))
         return p
 
     def add_heading2(self, text: str):
@@ -293,8 +316,8 @@ class VKRDocument:
         self._set_paragraph_format(p_img, align="center", first_line=0, left=0)
 
         if os.path.exists(image_path):
-            img = Image.open(image_path)
-            w, h = img.size
+            with Image.open(image_path) as img:
+                w, h = img.size
             aspect = h / w
             if width_cm is None:
                 width_cm = self._max_img_w
@@ -305,8 +328,8 @@ class VKRDocument:
 
             run = p_img.add_run()
             run.add_picture(image_path,
-                            width=int(width_cm * 360000),
-                            height=int(target_h * 360000))
+                            width=Cm(width_cm),
+                            height=Cm(target_h))
         else:
             p_img.add_run(f"[Файл не найден: {image_path}]")
 
@@ -329,12 +352,12 @@ class VKRDocument:
             p = cell.paragraphs[0]
             self._set_paragraph_format(p, align="center", first_line=0, left=0)
             if os.path.exists(img_path):
-                img = Image.open(img_path)
-                aspect = img.size[1] / img.size[0]
+                with Image.open(img_path) as img:
+                    aspect = img.size[1] / img.size[0]
                 run = p.add_run()
                 run.add_picture(img_path,
-                                width=int(width_cm * 360000),
-                                height=int(width_cm * aspect * 360000))
+                                width=Cm(width_cm),
+                                height=Cm(width_cm * aspect))
 
         p_cap = self.doc.add_paragraph()
         run_cap = p_cap.add_run(caption)
@@ -368,12 +391,17 @@ class VKRDocument:
             run.bold = True
             self._set_paragraph_format(p, align="center", first_line=0, left=0)
 
+        ncols = len(headers)
         for i, row in enumerate(rows):
-            for j, val in enumerate(row):
+            # Нормализация: дополнить короткие строки, обрезать длинные
+            normalized = list(row[:ncols])
+            while len(normalized) < ncols:
+                normalized.append("")
+            for j, val in enumerate(normalized):
                 cell = table.cell(i + 1, j)
                 p = cell.paragraphs[0]
                 p.clear()
-                run = p.add_run(val)
+                run = p.add_run(str(val))
                 run.font.name = self._font
                 run.font.size = Pt(self._font_size_table)
                 self._set_paragraph_format(p, align="center", first_line=0, left=0)
@@ -402,6 +430,94 @@ class VKRDocument:
             b.set(qn("w:sz"), "4")
             b.set(qn("w:space"), "0")
             b.set(qn("w:color"), "000000")
+
+    # ============================================================
+    # Добавление главы из markdown
+    # ============================================================
+
+    def add_chapter(self, md_path: str, figure_map: dict = None,
+                    images_dir: str = None, screenshot_nums: set = None,
+                    auto_fix: bool = True):
+        """Добавить главу из markdown-файла.
+
+        Args:
+            md_path: Путь к .md файлу с текстом главы.
+            figure_map: Словарь {номер_рисунка: путь_к_файлу} или
+                        {номер: (путь1, путь2)} для side-by-side.
+                        Если не указан — используется images_dir.
+            images_dir: Папка с изображениями. Файлы сопоставляются автоматически
+                        по имени: fig-1.png, рис-2.png, 3.png, fig-14a.png+fig-14b.png.
+            screenshot_nums: Множество номеров рисунков-скриншотов (~8 см).
+                             Если не указано — все рисунки используют max ширину.
+            auto_fix: Автоматически прогнать fix_styles + fix_image_sizes +
+                      add_crossrefs + update_toc после добавления (по умолчанию True).
+        """
+        from .parser import parse_chapter, scan_images_dir
+
+        with open(md_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+
+        blocks = parse_chapter(md_text)
+
+        # Автосопоставление изображений из папки
+        if figure_map is None and images_dir:
+            figure_map = scan_images_dir(images_dir)
+        figure_map = figure_map or {}
+        screenshot_nums = screenshot_nums or set()
+
+        stats = {"headings": 0, "paragraphs": 0, "figures": 0, "tables": 0}
+
+        for block in blocks:
+            if block.kind == "heading1":
+                self.add_heading1(block.text)
+                stats["headings"] += 1
+
+            elif block.kind == "heading2":
+                self.add_heading2(block.text)
+                stats["headings"] += 1
+
+            elif block.kind == "heading3":
+                self.add_heading3(block.text)
+                stats["headings"] += 1
+
+            elif block.kind == "text":
+                self.add_body_text(block.text)
+                stats["paragraphs"] += 1
+
+            elif block.kind == "figure":
+                num = block.figure_num
+                path = figure_map.get(num)
+                if path is None:
+                    # Вставить только подпись без картинки
+                    p = self.doc.add_paragraph()
+                    run = p.add_run(block.text)
+                    run.font.name = self._font
+                    run.font.size = Pt(self._font_size)
+                    self._set_paragraph_format(p, align="center", first_line=0, left=0)
+                elif isinstance(path, (tuple, list)):
+                    # Side by side
+                    width = self._side_by_side_w
+                    self.add_figure_side_by_side(path[0], path[1], block.text, width_cm=width)
+                else:
+                    width = self._screenshot_w if num in screenshot_nums else None
+                    self.add_figure(path, block.text, width_cm=width)
+                stats["figures"] += 1
+
+            elif block.kind == "table_caption":
+                self.add_table_caption(block.text)
+
+            elif block.kind == "table":
+                self.add_data_table(block.headers, block.rows)
+                stats["tables"] += 1
+
+        if auto_fix:
+            self.fix_page_setup()
+            self.fix_styles()
+            stats["images_fixed"] = self.fix_image_sizes()
+            stats["crossrefs"] = self.add_crossrefs()
+            stats["toc_entries"] = self.update_toc()
+
+        return stats
 
     # ============================================================
     # Перекрёстные ссылки
@@ -443,6 +559,8 @@ class VKRDocument:
         pattern = re.compile(
             r"(На рисунк|на рисунк|рисунках|в таблиц|Рисунок \d+\s*[—–-]|Таблица \d+\s*[—–-])"
         )
+        # Собираем параграфы, из которых удалили гиперссылки
+        affected_parents = set()
         for hl in list(self.doc.element.findall(".//" + qn("w:hyperlink"))):
             anchor = hl.get(qn("w:anchor"), "")
             if not anchor:
@@ -453,7 +571,9 @@ class VKRDocument:
                 for child in list(hl):
                     hl.addprevious(child)
                 parent.remove(hl)
+                affected_parents.add(parent)
 
+        # Удалить body-level закладки (старая логика)
         body = self.doc.element.body
         for bm in list(body.findall(qn("w:bookmarkStart"))):
             bid = bm.get(qn("w:id"))
@@ -461,6 +581,24 @@ class VKRDocument:
                 if be.get(qn("w:id")) == bid:
                     body.remove(be)
             body.remove(bm)
+
+        # Собрать все якоря, на которые ещё ссылаются гиперссылки
+        live_anchors = set()
+        for hl in self.doc.element.findall(".//" + qn("w:hyperlink")):
+            anchor = hl.get(qn("w:anchor"), "")
+            if anchor:
+                live_anchors.add(anchor)
+
+        # Удалить осиротевшие закладки в затронутых параграфах
+        for parent in affected_parents:
+            for bm in list(parent.findall(".//" + qn("w:bookmarkStart"))):
+                bm_name = bm.get(qn("w:name"), "")
+                if bm_name not in live_anchors:
+                    bid = bm.get(qn("w:id"))
+                    for be in list(parent.findall(".//" + qn("w:bookmarkEnd"))):
+                        if be.get(qn("w:id")) == bid:
+                            be.getparent().remove(be)
+                    bm.getparent().remove(bm)
 
     def _scan_refs_and_caps(self):
         refs, caps = {}, {}
@@ -578,6 +716,25 @@ class VKRDocument:
 
     def update_toc(self) -> int:
         """Обновить содержание по Heading 1/2/3."""
+        # Собрать якоря, используемые НЕ-TOC гиперссылками (кросс-ссылки и др.)
+        non_toc_anchors = set()
+        for hl in self.doc.element.findall(".//" + qn("w:hyperlink")):
+            anchor = hl.get(qn("w:anchor"), "")
+            if anchor:
+                non_toc_anchors.add(anchor)
+
+        # Удалить старые закладки из заголовков, если они не нужны другим ссылкам
+        for p in self.doc.paragraphs:
+            if p.style.name in ("Heading 1", "Heading 2", "Heading 3"):
+                for bm in list(p._element.findall(".//" + qn("w:bookmarkStart"))):
+                    bm_name = bm.get(qn("w:name"), "")
+                    if bm_name not in non_toc_anchors:
+                        bid = bm.get(qn("w:id"))
+                        for be in list(p._element.findall(".//" + qn("w:bookmarkEnd"))):
+                            if be.get(qn("w:id")) == bid:
+                                be.getparent().remove(be)
+                        bm.getparent().remove(bm)
+
         headings = []
         for i, p in enumerate(self.doc.paragraphs):
             if p.style.name in ("Heading 1", "Heading 2", "Heading 3"):
@@ -653,7 +810,7 @@ class VKRDocument:
 
     def fix_image_sizes(self) -> int:
         """Ограничить высоту всех изображений."""
-        max_h_emu = int(self._max_img_h * 360000)
+        max_h_emu = Cm(self._max_img_h)
         fixed = 0
         ns_wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
         ns_a = "http://schemas.openxmlformats.org/drawingml/2006/main"

@@ -2,10 +2,23 @@
 
 import glob
 import os
+import re
 import click
 
 from .config import load_config
-from .document import VKRDocument
+from .document import VKRDocument, VKRDocumentError
+
+
+def _parse_version_tuple(filepath: str) -> tuple:
+    """Извлечь числовую версию из имени файла ВКР."""
+    basename = os.path.basename(filepath)
+    m = re.search(r"ВКР (\d+)\.(\d+)\.?(\d*)", basename)
+    if m:
+        major = int(m.group(1))
+        minor = int(m.group(2))
+        patch = int(m.group(3)) if m.group(3) else 0
+        return (major, minor, patch)
+    return (0, 0, 0)
 
 
 def _find_latest_vkr(directory: str = ".") -> str | None:
@@ -14,8 +27,8 @@ def _find_latest_vkr(directory: str = ".") -> str | None:
     files = glob.glob(pattern)
     if not files:
         return None
-    # Сортировка по имени (версия в имени → лексикографический порядок)
-    files.sort()
+    # Сортировка по числовой версии (major, minor, patch)
+    files.sort(key=_parse_version_tuple)
     return files[-1]
 
 
@@ -123,6 +136,36 @@ def full_fix(ctx, file, overwrite):
 
     out = vkr.save_same() if overwrite else vkr.save()
     click.echo(f"Стили ✓ | Изображения: {imgs} | Ссылки: {refs} | Содержание: {toc_n}")
+    click.echo(f"Сохранено: {out}")
+
+
+@main.command("add-chapter")
+@click.argument("chapter_md")
+@click.argument("file", required=False)
+@click.option("--images", "images_dir", default=None, help="Папка с изображениями")
+@click.option("--overwrite", is_flag=True)
+@click.pass_context
+def add_chapter(ctx, chapter_md, file, images_dir, overwrite):
+    """Добавить главу из markdown-файла.
+
+    Изображения сопоставляются автоматически по именам:
+    fig-1.png, рис-2.png, 3.png, fig-14a.png+fig-14b.png
+    """
+    cfg = ctx.obj["config"]
+    path = _resolve_file(file, cfg)
+    vkr = VKRDocument(path, config=cfg)
+
+    stats = vkr.add_chapter(chapter_md, images_dir=images_dir)
+
+    out = vkr.save_same() if overwrite else vkr.save()
+    click.echo(
+        f"Глава добавлена: {stats.get('headings', 0)} заголовков, "
+        f"{stats.get('paragraphs', 0)} параграфов, "
+        f"{stats.get('figures', 0)} рисунков, "
+        f"{stats.get('tables', 0)} таблиц"
+    )
+    if "crossrefs" in stats:
+        click.echo(f"Ссылки: {stats['crossrefs']} | Содержание: {stats.get('toc_entries', 0)}")
     click.echo(f"Сохранено: {out}")
 
 

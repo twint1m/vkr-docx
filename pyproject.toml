@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vkr-docx"
+version = "0.1.0"
+description = "Инструмент оформления ВКР по ГОСТ 7.32-2017"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+dependencies = [
+    "python-docx>=1.1.0",
+    "Pillow>=10.0",
+    "lxml>=4.9",
+    "PyYAML>=6.0",
+    "click>=8.0",
+]
+
+[project.scripts]
+vkr-docx = "vkr_docx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

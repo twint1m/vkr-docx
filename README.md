@@ -6,10 +6,22 @@
 
 ## Установка
 
+### Одной командой (рекомендуется)
+
 ```bash
-git clone <repo-url> ~/projects/vkr-docx
+curl -fsSL https://raw.githubusercontent.com/twint1m/vkr-docx/main/install.sh | bash
+```
+
+Скрипт автоматически: клонирует репо, установит пакет, скопирует скилл `/vkr` и настроит Claude Code.
+
+### Вручную
+
+```bash
+git clone https://github.com/twint1m/vkr-docx.git ~/projects/vkr-docx
 cd ~/projects/vkr-docx
 pip install -e .
+cp -r .claude/commands/ ~/.claude/commands/
+cp CLAUDE.md ~/CLAUDE.md
 ```
 
 ## Быстрый старт
